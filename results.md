@@ -16,7 +16,9 @@ Method 4 is a two-stage pipeline. We did **not** rebuild VideoLLaMA3. We used th
 
 **Stage 2 — Temporal Evidence Contract (TEC).** That draft is split into short claims. Each claim must look like: text + time interval in the video + how sure we are (observed / derived / hypothesised / undetermined). A verifier then looks at the cited frames. If the frames support the claim, we keep it. If not, we revise it or mark it undetermined.
 
-We ran this as an ablation ladder (add one piece at a time) on the full test set:
+**What ablation means:** we do **not** change everything at once. We start from the plain VideoLLaMA3 draft (A0) and **add one extra piece at a time**. If the score goes up after we add a piece, that piece helped. If it stays the same or drops, that piece did not help. That is how we know which part of Method 4 is actually useful.
+
+We ran this ladder on the full test set:
 
 | ID | What we ran |
 |----|-------------|
