@@ -1,10 +1,13 @@
 # Complete Results & Architecture Reference
 
 **Project:** Agentic Fall Detection (confidence-gated multi-agent wrapper)  
-**Primary stack (no Critic):** `gate_knn_llm` = Tier-1 → Gate → kNN → Mistral (Ollama) → Action  
+**Primary stack (Non-Critique):** `gate_knn_llm` = Tier-1 → Gate → kNN → Mistral (Ollama) → Action  
+**Optional stack (Critique):** `gate_knn_llm_action_critique` / `gate_knn_llm_contrastive_action_critique` = same + Heuristic Critic (labels frozen)  
 **LLM:** `mistral:latest` via Ollama (`http://127.0.0.1:11434`)  
 **Cost metric:** `10×FN + 1×FP` (clinical safety cost; missed falls weighted 10×)  
 **Generated:** 2026-08-22  
+
+> This document includes **both** architecture diagrams (critique + non-critique) and **side-by-side result tables** on every dataset.
 
 ---
 
@@ -19,7 +22,7 @@
 7. [KFall — modified ambiguous bench (300/fold)](#7-kfall--modified-ambiguous-bench-300fold)
 8. [Ablation ladder (module contribution)](#8-ablation-ladder-module-contribution)
 9. [LLM backend comparison (Mistral vs heuristic vs Qwen)](#9-llm-backend-comparison-mistral-vs-heuristic-vs-qwen)
-10. [Critique vs no-Critic (all modes)](#10-critique-vs-no-critic-all-modes)
+10. [Critique vs Non-Critique — full comparison all datasets](#10-critique-vs-non-critique--full-comparison-all-datasets)
 11. [Master summary across all datasets](#11-master-summary-across-all-datasets)
 12. [What to claim / what not to claim](#12-what-to-claim--what-not-to-claim)
 13. [Source files index](#13-source-files-index)
@@ -28,41 +31,191 @@
 
 ## 1. Architecture diagrams (Mermaid)
 
-### 1.1 End-to-end pipeline (`gate_knn_llm`, no Critic)
+### 1.0 Side-by-side: Non-Critique vs Critique (overview)
+
+| Aspect | **Non-Critique** (`gate_knn_llm`) | **Critique** (`gate_knn_llm_action_critique` / contrastive) |
+|--------|-----------------------------------|-------------------------------------------------------------|
+| **Config** | `adjudication.enabled: false` | `adjudication.enabled: true`, `freeze_label: true` |
+| **Actor** | Mistral LLM Reasoner | Same Mistral LLM |
+| **Critic** | None | Heuristic Critic (Σ weights on biomechanics) |
+| **Can flip fall/ADL label?** | LLM decides | **No** — label frozen; Critic only revises action/rationale |
+| **kNN on escalate** | Standard top-k | Standard or **contrastive** (pos fall + neg ADL cases) |
+| **Primary use** | **Main paper detection tables** | Appendix: grounding + graded action cost |
+| **Detection F1 gain** | Baseline | ~+0.001 F1 (negligible) |
+| **Grounding gain** | ~0.44 | ~0.45 (action) / **~0.84** (contrastive) |
+
+```mermaid
+flowchart LR
+  subgraph noncrit [NonCritique PRIMARY]
+    NC1[IMU] --> NC2[Tier1]
+    NC2 --> NC3[Gate]
+    NC3 --> NC4[Evidence kNN]
+    NC4 --> NC5[Mistral Actor]
+    NC5 --> NC6[Action Agent]
+  end
+
+  subgraph crit [Critique OPTIONAL appendix]
+    C1[IMU] --> C2[Tier1]
+    C2 --> C3[Gate]
+    C3 --> C4[Evidence kNN]
+    C4 --> C5[Mistral Actor]
+    C5 --> C6[Heuristic Critic]
+    C6 --> C7[Adjudicator freeze_label]
+    C7 --> C8[Action Agent]
+  end
+```
+
+---
+
+### 1.1 NON-CRITIQUE architecture — full pipeline (`gate_knn_llm`)
+
+**Mode name:** `gate_knn_llm` · **Critic:** OFF · **This is the primary paper stack.**
 
 ```mermaid
 flowchart TB
-  subgraph input [Input]
-    IMU["IMU window\n6 channels × 90 frames"]
+  IMU["Wearable IMU window\n6 channels x 90 frames SisFall\n3 or 6 ch KFall"]
+
+  subgraph tier1block [Tier1 Fixed at inference]
+    T1["cnn_lstm_attn\nBhatti-style CNN-LSTM-Attention"]
+    PF["Outputs: p_fall softmax embedding"]
   end
 
-  subgraph tier1 [Tier1 BhattiStyle CNN-LSTM-Attention]
-    T1["cnn_lstm_attn\np_fall + embedding"]
+  subgraph gateblock [Confidence Gate]
+    G{"Route by p_fall"}
+    TLOW["p <= tau_low -> ADL direct"]
+    THIGH["p >= tau_high -> Fall direct"]
+    TAMB["else -> AMBIGUOUS escalate"]
   end
 
-  subgraph gate [Confidence Gate]
-    G{"p_fall vs tau_low / tau_high"}
+  subgraph escalate [Escalated path only]
+    EV["Evidence Serializer\nfreefall impact stillness tilt activity"]
+    KNN["kNN Memory retrieve k=5\nMiniLM embed evidence text"]
+    ACTOR["LLM Reasoner ACTOR ONLY\nMistral CoT JSON\nprediction severity rationale action"]
   end
 
-  subgraph fast [Fast path]
-    ADL["Confident ADL"]
-    FALL["Confident Fall"]
+  subgraph output [Output layer]
+    ACT["Action Agent\ncost-sensitive policy\nemergency notify monitor log"]
+    OUT["PipelineResult\nlabel action rationale cost"]
   end
 
-  subgraph slow [Slow path ambiguous only]
-    EV["Evidence Serializer\nfreefall impact stillness tilt"]
-    KNN["kNN Memory\nMiniLM embed k=5"]
-    LLM["LLM Reasoner\nMistral CoT JSON"]
-    ACT["Action Agent\nemergency notify monitor log"]
-  end
-
-  IMU --> T1 --> G
-  G -->|"p <= tau_low"| ADL --> ACT
-  G -->|"p >= tau_high"| FALL --> ACT
-  G -->|"ambiguous"| EV --> KNN --> LLM --> ACT
+  IMU --> T1 --> PF --> G
+  G --> TLOW --> ACT
+  G --> THIGH --> ACT
+  G --> TAMB --> EV --> KNN --> ACTOR --> ACT
+  ACT --> OUT
 ```
 
-### 1.2 Tier-1 detector block (Bhatti-style reimplementation)
+**Components (no Critic):**
+
+| Step | Module | File |
+|------|--------|------|
+| 1 | Tier-1 detector | `src/agentic_fall/models/cnn_lstm_attn.py` |
+| 2 | Confidence gate | `src/agentic_fall/agents/confidence_gate.py` |
+| 3 | Evidence | `src/agentic_fall/agents/evidence.py` |
+| 4 | kNN memory | `src/agentic_fall/agents/knn_memory.py` |
+| 5 | LLM Actor | `src/agentic_fall/agents/llm_reasoner.py` |
+| 6 | Action | `src/agentic_fall/agents/action_agent.py` |
+| 7 | Pipeline | `src/agentic_fall/agents/pipeline.py` (`adjudicator=None`) |
+
+---
+
+### 1.2 CRITIQUE architecture — full pipeline (`gate_knn_llm_action_critique`)
+
+**Mode name:** `gate_knn_llm_action_critique` · **Critic:** ON · **Q1-safe: labels frozen.**
+
+```mermaid
+flowchart TB
+  IMU["Wearable IMU window\nsame as non-critique"]
+
+  subgraph tier1block [Tier1 Fixed at inference]
+    T1["cnn_lstm_attn"]
+    PF["p_fall + embedding"]
+  end
+
+  subgraph gateblock [Confidence Gate]
+    G{"Route by p_fall"}
+    FAST["Confident ADL or Fall"]
+    TAMB["Ambiguous escalate"]
+  end
+
+  subgraph escalate [Escalated OR confident-fall screening]
+    EV["Evidence Serializer"]
+    KNN["kNN Memory k=5\nor contrastive pos+neg"]
+    PACK["ConstraintPack\nbiomechanical checklist"]
+    ACTOR["Actor Mistral LLM\nhypothesis prediction severity action"]
+    CRIT["Critic heuristic\nfreefall impact stillness tilt knn pf"]
+    ADJ["Adjudicator\nfreeze_label=true\nmerge action + rationale only"]
+  end
+
+  subgraph output [Output layer]
+    ACT["Action Agent\nallow downgrade if critic revise"]
+    OUT["label UNCHANGED by critic\nrevised action + grounded rationale"]
+  end
+
+  IMU --> T1 --> PF --> G
+  G --> FAST --> EV
+  G --> TAMB --> EV
+  EV --> KNN --> PACK --> ACTOR --> CRIT --> ADJ --> ACT --> OUT
+```
+
+**What the Critic can / cannot do:**
+
+| Critic action | Allowed? |
+|---------------|----------|
+| Change fall ↔ ADL label (`freeze_label=true`) | **No** |
+| Downgrade action emergency → notify → monitor | **Yes** |
+| Ground rationale with Σ(w) biomechanical checklist | **Yes** |
+| Reject over-claimed emergency on weak evidence | **Yes** |
+
+**Components (with Critic):**
+
+| Step | Module | File |
+|------|--------|------|
+| 1–4 | Same as non-critique | (see §1.1) |
+| 5 | Actor (Mistral) | `llm_reasoner.py` via `critic_agent._heuristic_actor` or LLM |
+| 6 | Critic (heuristic) | `src/agentic_fall/agents/critic_agent.py` |
+| 7 | Adjudicator | `src/agentic_fall/agents/adjudicator.py` |
+| Config | `adjudication.enabled: true`, `mode: action_critique` | `configs/agentic.yaml` |
+
+---
+
+### 1.3 CRITIQUE variant — contrastive action critique
+
+**Mode name:** `gate_knn_llm_contrastive_action_critique` · Adds hard-negative ADL retrieval.
+
+```mermaid
+flowchart TB
+  IMU[IMU window] --> T1[Tier1] --> G[Gate]
+  G -->|escalate| EV[Evidence]
+  EV --> CR["Contrastive kNN\nk_pos=3 fall cases\nk_neg=3 ADL cases"]
+  CR --> ACTOR[Mistral Actor]
+  ACTOR --> CRIT[Heuristic Critic\nsees pos+neg cases]
+  CRIT --> ADJ[Adjudicator freeze_label]
+  ADJ --> ACT[Action Agent]
+```
+
+**Effect vs non-critique:** Detection F1 similar; **rationale grounding ~0.44 → ~0.84**; **graded action cost ~588 → ~324**.
+
+---
+
+### 1.4 CRITIQUE variant — harmful label-flip (`gate_knn_llm_actor_critic`) — DO NOT USE
+
+**Mode:** `actor_critic` with `freeze_label=false` · **Flips fall→ADL → FN explosion.**
+
+```mermaid
+flowchart TB
+  IMU[IMU window] --> T1[Tier1] --> G[Gate] --> EV[Evidence kNN]
+  EV --> ACTOR[Mistral Actor]
+  ACTOR --> CRIT[Critic can REJECT fall label]
+  CRIT --> ADJ["Adjudicator\nCAN flip fall to ADL"]
+  ADJ --> OUT["Missed falls increase\nFN 6 to 105 on fold 0"]
+```
+
+> **Negative ablation only.** Never use in main paper tables.
+
+---
+
+### 1.5 Tier-1 detector block (shared by both paths)
 
 ```mermaid
 flowchart LR
@@ -82,7 +235,7 @@ flowchart LR
 **Code:** `src/agentic_fall/models/cnn_lstm_attn.py`  
 **Config:** `configs/tier1_sisfall.yaml`, `configs/tier1_kfall_binary.yaml`
 
-### 1.3 Bhatti vs our full system
+### 1.6 Bhatti vs our systems (non-critique primary)
 
 ```mermaid
 flowchart TB
@@ -98,7 +251,7 @@ flowchart TB
   end
 ```
 
-### 1.4 Ablation mode ladder
+### 1.7 Ablation mode ladder (non-critique → critique extensions)
 
 ```mermaid
 flowchart TD
@@ -118,19 +271,7 @@ flowchart TD
   FULL -.->|harmful| BAD
 ```
 
-### 1.5 Critique-enabled path (optional appendix only)
-
-```mermaid
-flowchart LR
-  ESC["Escalated ambiguous window"] --> ACTOR["Actor LLM\nMistral fall/ADL"]
-  ACTOR --> CRIT["Critic heuristic\nfreeze_label=true"]
-  CRIT --> ADJ["Adjudicator\naction downgrade only"]
-  ADJ --> OUT["Final label + action + rationale"]
-```
-
-**Default:** `adjudication.enabled: false` in `configs/agentic.yaml`
-
-### 1.6 Dataset evaluation map
+### 1.8 Dataset evaluation map
 
 ```mermaid
 flowchart LR
@@ -229,6 +370,28 @@ flowchart LR
 
 **Source:** `results/PROFESSOR_MEETING_BRIEF.md`
 
+### Table 4.4 — SisFall main: Non-Critique vs Critique (same folds, n=1000)
+
+| Fold | **No Critic** F1 / Rec / FN / Cost | **action_critique** F1 / Rec / FN / Cost | **contrastive_critique** F1 / Rec / FN / Cost | Grounding no-crit → contrastive |
+|------|-------------------------------------|------------------------------------------|-----------------------------------------------|--------------------------------|
+| 0 | **0.891 / 0.986 / 6 / 157** | 0.892 / 0.986 / 6 / 156 | 0.878 / 0.986 / 6 / 172 | 0.431 → **0.851** |
+| 1 | **0.851 / 0.911 / 39 / 490** | 0.852 / 0.911 / 39 / 489 | 0.846 / 0.911 / 39 / 496 | 0.337 → **0.749** |
+| 2 | **0.896 / 0.986 / 6 / 153** | 0.896 / 0.986 / 6 / 153 | 0.888 / 0.986 / 6 / 162 | 0.474 → **0.871** |
+| 3 | **0.918 / 0.993 / 3 / 105** | 0.917 / 0.993 / 3 / 106 | 0.903 / 0.993 / 3 / 120 | 0.486 → **0.874** |
+| 4 | **0.897 / 0.981 / 8 / 169** | 0.897 / 0.981 / 8 / 169 | 0.876 / 0.981 / 8 / 192 | 0.461 → **0.868** |
+| **Mean** | **0.890 / 0.974 / 12.4 / 215** | 0.891 / 0.971 / 12.4 / 215 | 0.878 / 0.971 / 12.4 / 228 | 0.44 → **0.84** |
+
+| Metric | No Critic | action_critique | contrastive_critique | actor_critic ❌ |
+|--------|-----------|-----------------|----------------------|-----------------|
+| F1 | **0.890** | 0.891 | 0.878 | 0.704 |
+| Recall | **0.974** | 0.971 | 0.971 | 0.730 |
+| FN (mean) | **12.4** | 12.4 | 12.4 | 97.7 |
+| Clinical cost | **215** | 215 | 228 | 1133 |
+| Rationale grounding | 0.436 | 0.448 | **0.843** | — |
+| Graded action cost | 588 | 586 | **324** | — |
+
+**Readout:** On SisFall main, **detection is unchanged** with Q1-safe critique; **contrastive critique** improves explanation/action metrics, not F1.
+
 ---
 
 ## 5. SisFall — modified ambiguous bench (300/fold)
@@ -256,6 +419,18 @@ flowchart LR
 
 - Cost reduction (Mistral stack vs tier1): **83.6%**
 - ΔF1 (Mistral stack vs tier1): **+0.183**
+
+### Table 5.3 — SisFall ambiguous: Non-Critique vs Critique
+
+| Mode | F1 | Recall | Cost | AmbAcc | Critic? | Status |
+|------|-----|--------|------|--------|---------|--------|
+| `tier1_only` | 0.713 | 0.768 | 271 | 0.812 | No | Done |
+| **`gate_knn_llm` (Mistral)** | **0.896** | **0.976** | **44** | **0.966** | **No** | Done |
+| `gate_knn_llm` (heuristic) | 0.766 | 0.726 | 291 | 0.990 | No | Done (ablation) |
+| `gate_knn_llm_action_critique` | — | — | — | — | Yes | **Not run yet** |
+| `gate_knn_llm_contrastive_action_critique` | — | — | — | — | Yes | **Not run yet** |
+
+> Ambiguous bench currently reports **non-critique only**. To compare critique on D18/D19 stress test, re-run `eval_kfold_ambiguous_bench.py` with `--adjudicator action_critique`.
 
 **Source:** `results/kfold_ambiguous/COMPARISON_NO_CRITIC.txt`, `ALL_FOLDS_REPORT.txt`, `results/kfold_ambiguous_heuristic/`
 
@@ -285,6 +460,15 @@ flowchart LR
 
 > KFall Tier-1 is near ceiling; agentic stack mainly **lowers cost** and slightly improves recall.
 
+### Table 6.3 — KFall binary main: Non-Critique vs Critique
+
+| Mode | F1 | Recall | Cost / 1000 | Critic? | Status |
+|------|-----|--------|-------------|---------|--------|
+| `tier1_only` | 0.987 ± 0.005 | 0.991 ± 0.007 | 50 ± 35 | No | Done |
+| **`gate_knn_llm`** | **0.990 ± 0.004** | **0.996 ± 0.002** | **26 ± 12** | **No** | Done |
+| `gate_knn_llm_action_critique` | — | — | — | Yes | **Not run** |
+| `gate_knn_llm_contrastive_action_critique` | — | — | — | Yes | **Not run** |
+
 ---
 
 ## 7. KFall — modified ambiguous bench (300/fold)
@@ -310,6 +494,15 @@ flowchart LR
 | **`gate_knn_llm` (Mistral)** | **0.983 ± 0.012** | **0.998 ± 0.004** | **5.2 ± 4.2** | **0.976** | 0.016 |
 
 - Mean tier1 Cost = **12** → stack Cost = **5** (~58% reduction)
+
+### Table 7.3 — KFall ambiguous: Non-Critique vs Critique
+
+| Mode | F1 | Recall | Cost | AmbAcc | Critic? | Status |
+|------|-----|--------|------|--------|---------|--------|
+| `tier1_only` | 0.968 | 0.994 | 12 | 0.942 | No | Done |
+| **`gate_knn_llm` (Mistral)** | **0.983 ± 0.012** | **0.998 ± 0.004** | **5.2 ± 4.2** | **0.976** | **No** | Done |
+| `gate_knn_llm_action_critique` | — | — | — | — | Yes | **Not run** |
+| `gate_knn_llm_contrastive_action_critique` | — | — | — | — | Yes | **Not run** |
 
 ---
 
@@ -355,68 +548,102 @@ flowchart LR
 
 ---
 
-## 10. Critique vs no-Critic (all modes)
+## 10. Critique vs Non-Critique — full comparison all datasets
 
-### 10.1 Executive summary
+### 10.1 Architecture recap (two stacks)
 
-| Question | Answer |
-|----------|--------|
-| Does Critic improve **detection** F1/recall/FN? | **No meaningful gain** when labels are frozen |
-| Does Critic improve **grounding / action grading**? | **Yes, modestly** (contrastive critique) |
-| Should Critic be the **main paper claim**? | **No** — keep `gate_knn_llm` as primary |
-| Where did ambiguous benches run Critic? | **Not yet** — ambiguous runs are no-Critic only |
+| | **Non-Critique (PRIMARY)** | **Critique (APPENDIX)** |
+|---|---------------------------|-------------------------|
+| **Diagram** | [§1.1 NON-CRITIQUE architecture](#11-non-critique-architecture--full-pipeline-gate_knn_llm) | [§1.2 CRITIQUE architecture](#12-critique-architecture--full-pipeline-gate_knn_llm_action_critique) |
+| **Mode flag** | `gate_knn_llm` | `gate_knn_llm_action_critique` or `gate_knn_llm_contrastive_action_critique` |
+| **Pipeline path** | Tier1 → Gate → Evidence → kNN → **Mistral** → Action | Same + **Heuristic Critic** → Adjudicator |
+| **Label changes** | LLM Actor decides fall/ADL | **Frozen** — Critic cannot flip label (Q1-safe) |
+| **Extra LLM call** | 1× Mistral per escalated window | Same Actor + 0 extra neural LLM (Critic is heuristic) |
 
-### 10.2 SisFall main 5-fold — detection metrics (n=1000)
+### 10.2 Master comparison table — all datasets
 
-| Mode | F1 (mean) | Recall (mean) | FN (mean) | Grounding | Graded action cost |
-|------|-----------|---------------|-----------|-----------|-------------------|
-| **`gate_knn_llm` (no Critic)** | **0.890** | **0.974** | **12.4** | 0.436 | 588 |
-| `gate_knn_llm_action_critique` | 0.891 | 0.971 | 12.4 | 0.448 | 586 |
-| `gate_knn_llm_contrastive_action_critique` | 0.878 | 0.971 | 12.4 | **0.843** | **324** |
-| `gate_knn_llm_crc_veto` | 0.891 | 0.971 | 12.4 | 0.448 | 579 |
-| `gate_knn_llm_actor_critic` ❌ | 0.704 | 0.730 | **97.7** | — | — |
+| Dataset | Metric | tier1_only | **No Critic** `gate_knn_llm` | **Critique** action | **Critique** contrastive | Critique runs? |
+|---------|--------|------------|-------------------------------|---------------------|--------------------------|----------------|
+| **SisFall main** | F1 | 0.759 | **0.887** | 0.891 | 0.878 | Yes (5-fold) |
+| **SisFall main** | Recall | 0.759 | **0.977** | 0.971 | 0.971 | Yes |
+| **SisFall main** | Cost/1k | 1151 | **200** | 215 | 228 | Yes |
+| **SisFall main** | Grounding | — | 0.436 | 0.448 | **0.843** | Yes |
+| **SisFall ambiguous** | F1 | 0.713 | **0.896** | — | — | **No critic yet** |
+| **SisFall ambiguous** | Cost | 271 | **44** | — | — | **No critic yet** |
+| **KFall binary** | F1 | 0.987 | **0.990** | — | — | **No critic yet** |
+| **KFall binary** | Cost/1k | 50 | **26** | — | — | **No critic yet** |
+| **KFall ambiguous** | F1 | 0.968 | **0.983** | — | — | **No critic yet** |
+| **KFall ambiguous** | Cost | 12 | **5.2** | — | — | **No critic yet** |
 
-### 10.3 Per-fold: no Critic vs action_critique (labels frozen)
+### 10.3 SisFall main — per-fold side-by-side (detection + explanation)
 
-| Fold | gate_knn_llm F1/Rec/FN | action_critique F1/Rec/FN | Grounding Δ |
-|------|------------------------|---------------------------|-------------|
-| 0 | 0.892 / 0.986 / 6 | 0.892 / 0.986 / 6 | 0.429 → 0.443 |
-| 1 | 0.851 / 0.911 / 39 | 0.852 / 0.911 / 39 | 0.337 → 0.349 |
-| 2 | 0.896 / 0.986 / 6 | 0.896 / 0.986 / 6 | 0.470 → 0.482 |
-| 3 | 0.918 / 0.993 / 3 | 0.917 / 0.993 / 3 | 0.481 → 0.495 |
-| 4 | 0.895 / 0.981 / 8 | 0.897 / 0.981 / 8 | 0.461 → 0.470 |
+| Fold | No Critic F1 | action_critique F1 | contrastive F1 | Δ F1 (critique − no critic) | No Critic FN | Critique FN | Grounding (contrastive) |
+|------|--------------|-------------------|----------------|------------------------------|--------------|-------------|-------------------------|
+| 0 | 0.891 | 0.892 | 0.878 | +0.001 / −0.013 | 6 | 6 | 0.851 |
+| 1 | 0.851 | 0.852 | 0.846 | +0.001 / −0.005 | 39 | 39 | 0.749 |
+| 2 | 0.896 | 0.896 | 0.888 | 0 / −0.008 | 6 | 6 | 0.871 |
+| 3 | 0.918 | 0.917 | 0.903 | −0.001 / −0.015 | 3 | 3 | 0.874 |
+| 4 | 0.897 | 0.897 | 0.876 | 0 / −0.021 | 8 | 8 | 0.868 |
 
-### 10.4 Harmful mode — label-flip Actor-Critic (negative ablation)
+### 10.4 Detection vs explanation metrics (SisFall main, 5-fold mean)
 
-| Fold | gate_knn_llm F1 / Rec | actor_critic F1 / Rec |
-|------|----------------------|------------------------|
-| 0 | 0.893 / 0.986 | **0.768 / 0.755** (FN 6→105) |
-| 1–4 | ~0.85–0.92 | Similar collapse |
+| Metric type | No Critic | action_critique | contrastive_critique | actor_critic ❌ |
+|-------------|-----------|-----------------|----------------------|-----------------|
+| **Detection F1** | **0.890** | 0.891 | 0.878 | 0.704 |
+| **Detection Recall** | **0.974** | 0.971 | 0.971 | 0.730 |
+| **FN (mean)** | **12.4** | 12.4 | 12.4 | 97.7 |
+| **Clinical cost** | **215** | 215 | 228 | 1133 |
+| **Rationale grounding** | 0.436 | 0.448 | **0.843** | — |
+| **Graded action cost** | 588 | 586 | **324** | — |
 
-**Do not use `gate_knn_llm_actor_critic` in main tables.**
+### 10.5 Non-Critique vs Critique — what improves / what does not
 
-### 10.5 Where gains actually come from (no Critic path)
+| Improves with Critique? | action_critique | contrastive_critique |
+|-------------------------|-----------------|----------------------|
+| Fall detection F1 | No (~+0.001) | No (~−0.012) |
+| Recall / missed falls (FN) | No (identical) | No (identical) |
+| Clinical cost (10×FN+FP) | No | No (slightly higher) |
+| Rationale grounding | Slightly (+0.01) | **Strong (+0.40)** |
+| Graded action cost | Barely (−2) | **Strong (−264)** |
+| Near-fall FAR | No | No |
 
-| Step | ΔF1 (approx.) | ΔRecall | Cost reduction |
-|------|---------------|---------|----------------|
-| tier1_only → gate_knn_llm | **+0.128** | **+0.218** | **~83%** |
-| gate_knn → gate_knn_llm | large on ambiguous | large | large |
-| gate_knn_llm → + Critic | +0.004 F1 | ~0 | negligible |
+### 10.6 Harmful critique mode — label-flip `actor_critic` (negative ablation)
 
-**Sources:** `results/ACTOR_CRITIC_STATUS.md`, `results/CRITIC_ACTION_IMPACT.md`, `results/fold*/ablation_fold*_action_critique.json`
+| Fold | No Critic F1 / Rec / FN | actor_critic F1 / Rec / FN |
+|------|-------------------------|----------------------------|
+| 0 | 0.893 / 0.986 / 6 | **0.768 / 0.755 / 105** |
+| 1 | 0.851 / 0.911 / 39 | **0.744 / 0.714 / 125** |
+| 2 | 0.896 / 0.986 / 6 | **0.757 / 0.725 / 119** |
+| 3 | 0.918 / 0.993 / 3 | **0.766 / 0.721 / 122** |
+| 4 | 0.895 / 0.981 / 8 | **0.769 / 0.744 / 110** |
+
+See diagram: [§1.4 CRITIQUE harmful label-flip](#14-critique-variant--harmful-label-flip-gate_knn_llm_actor_critic--do-not-use)
+
+### 10.7 Where the big gains come from (non-critique path)
+
+| Transition | ΔF1 | ΔRecall | Cost reduction |
+|------------|-----|---------|----------------|
+| tier1_only → **gate_knn_llm (no critic)** | **+0.128** | **+0.218** | **~83%** |
+| gate_knn → gate_knn_llm | large | large | large |
+| gate_knn_llm → + action_critique | +0.001 | ~0 | ~0% |
+| gate_knn_llm → + contrastive_critique | −0.012 | ~0 | slight increase |
+
+**Conclusion:** Use **non-critique `gate_knn_llm`** for main detection claims. Use **contrastive critique** only for appendix tables on grounding and graded action.
+
+**Sources:** `results/ACTOR_CRITIC_STATUS.md`, `results/CRITIC_ACTION_IMPACT.md`, `results/fold*/ablation_fold*_action_critique.json`, `results/fold*/ablation_fold*_contrastive_action_critique.json`
 
 ---
 
 ## 11. Master summary across all datasets
 
-| Dataset | Protocol | Bhatti (ref.) | tier1_only | gate_knn_llm (no Critic) | ΔF1 | Cost ↓ |
-|---------|----------|---------------|------------|--------------------------|-----|--------|
-| **SisFall main** | n=1000 × 5-fold | ~98% F1† KFall 36-class | 0.759 F1, cost 1151/1k | **0.887 F1, cost 200/1k** | +0.128 | ~83% |
-| **SisFall ambiguous** | n=300 × 5-fold | N/A | 0.713 F1, cost 271 | **0.896 F1, cost 44** | +0.183 | ~84% |
-| **KFall binary main** | n=1000 × 5-fold | ~98% F1† published | 0.987 F1, cost 50/1k | **0.990 F1, cost 26/1k** | +0.003 | ~48% |
-| **KFall ambiguous** | n=300 × 5-fold | N/A | 0.968 F1, cost 12 | **0.983 F1, cost 5** | +0.015 | ~58% |
+| Dataset | tier1_only | **No Critic** `gate_knn_llm` | **Critique** (SisFall main only) | ΔF1 (stack−tier1) |
+|---------|------------|-------------------------------|----------------------------------|-------------------|
+| **SisFall main** (n=1000) | 0.759 F1, cost 1151/1k | **0.887 F1, cost 200/1k** | action: 0.891 F1 · contrastive: 0.878 F1 | +0.128 |
+| **SisFall ambiguous** (n=300) | 0.713 F1, cost 271 | **0.896 F1, cost 44** | not run | +0.183 |
+| **KFall binary** (n=1000) | 0.987 F1, cost 50/1k | **0.990 F1, cost 26/1k** | not run | +0.003 |
+| **KFall ambiguous** (n=300) | 0.968 F1, cost 12 | **0.983 F1, cost 5** | not run | +0.015 |
 
-† Bhatti published numbers are **not directly comparable** (36-class multi-phase KFall vs our binary + agentic protocols).
+| Reference | Bhatti et al. 2025 (~98% F1, 36-class KFall) — not directly comparable |
 
 ---
 
